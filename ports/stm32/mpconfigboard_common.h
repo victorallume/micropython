@@ -447,6 +447,14 @@
 #define MICROPY_HW_RTC_USE_BYPASS (0)
 #endif
 
+// Use HSE (via RTCPRE divider) as the RTC clock instead of LSE/LSI.
+// When enabled, define MICROPY_HW_RTC_HSE_RTCCLKSOURCE (e.g. RCC_RTCCLKSOURCE_HSE_DIV25)
+// and set RTC_ASYNCH_PREDIV / RTC_SYNCH_PREDIV for that RTCCLK rate.
+// Note: HSE stops in Stop/Standby, so RTC will not keep time in those modes.
+#ifndef MICROPY_HW_RTC_USE_HSE
+#define MICROPY_HW_RTC_USE_HSE (0)
+#endif
+
 #if MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE
 // Provide block device macros if internal flash storage is enabled
 #define MICROPY_HW_BDEV_IOCTL flash_bdev_ioctl
