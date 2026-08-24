@@ -74,7 +74,12 @@ STATIC void PYB_RTC_MspInit_Kick(RTC_HandleTypeDef *hrtc, bool rtc_use_lse, bool
 STATIC HAL_StatusTypeDef PYB_RTC_MspInit_Finalise(RTC_HandleTypeDef *hrtc);
 STATIC void RTC_CalendarConfig(void);
 
-#if MICROPY_HW_RTC_USE_LSE || MICROPY_HW_RTC_USE_BYPASS
+#if MICROPY_HW_RTC_USE_HSE
+STATIC bool rtc_use_hse = true;
+#else
+STATIC bool rtc_use_hse = false;
+#endif
+#if !MICROPY_HW_RTC_USE_HSE && (MICROPY_HW_RTC_USE_LSE || MICROPY_HW_RTC_USE_BYPASS)
 STATIC bool rtc_use_lse = true;
 #else
 STATIC bool rtc_use_lse = false;
@@ -116,6 +121,20 @@ void rtc_init_start(bool force_init) {
     if (!force_init) {
         bool rtc_running = false;
         uint32_t bdcr = RCC->BDCR;
+        #if MICROPY_HW_RTC_USE_HSE
+        if ((bdcr & (RCC_BDCR_RTCEN | RCC_BDCR_RTCSEL))
+            == (RCC_BDCR_RTCEN | RCC_BDCR_RTCSEL_0 | RCC_BDCR_RTCSEL_1)
+            && __HAL_RCC_GET_FLAG(RCC_FLAG_HSERDY) != RESET) {
+            // HSE/RTCPRE configured as the RTC clock source --> no need to (re-)init RTC
+            rtc_running = true;
+            // remove Backup Domain write protection
+            HAL_PWR_EnableBkUpAccess();
+            // Clear source Reset Flag
+            __HAL_RCC_CLEAR_RESET_FLAGS();
+            // provide some status information
+            rtc_info |= 0xc0000;
+        }
+        #else
         if ((bdcr & (RCC_BDCR_RTCEN | RCC_BDCR_RTCSEL | RCC_BDCR_LSEON | RCC_BDCR_LSERDY))
             == (RCC_BDCR_RTCEN | RCC_BDCR_RTCSEL_0 | RCC_BDCR_LSEON | RCC_BDCR_LSERDY)) {
             // LSE is enabled & ready --> no need to (re-)init RTC
@@ -139,6 +158,7 @@ void rtc_init_start(bool force_init) {
             // provide some status information
             rtc_info |= 0x80000;
         }
+        #endif
 
         if (rtc_running) {
             // Provide information about the registers that indicated the RTC is running.
@@ -186,7 +206,12 @@ void rtc_init_finalise() {
 
     rtc_info = 0;
     while (PYB_RTC_Init(&RTCHandle) != HAL_OK) {
-        if (rtc_use_lse) {
+        if (rtc_use_hse) {
+            // HSE is already required for the system clock on boards that use it for
+            // RTC; do not fall back to LSI because RTC_*_PREDIV are sized for HSE/div.
+            rtc_info |= 0x04000000 | 0xffff;
+            return;
+        } else if (rtc_use_lse) {
             #if MICROPY_HW_RTC_USE_BYPASS
             if (RCC->BDCR & RCC_BDCR_LSEBYP) {
                 // LSEBYP failed, fallback to LSE non-bypass
@@ -212,8 +237,9 @@ void rtc_init_finalise() {
     // RTC started successfully
     rtc_info = 0x20000000;
 
-    // record if LSE or LSI is used
+    // record if LSE or LSI is used (bit 28); HSE is indicated by bit 27
     rtc_info |= (rtc_use_lse << 28);
+    rtc_info |= (rtc_use_hse << 27);
 
     // record how long it took for the RTC to start up
     rtc_info |= (HAL_GetTick() - rtc_startup_tick) & 0xffff;
@@ -369,7 +395,7 @@ STATIC HAL_StatusTypeDef PYB_RTC_Init(RTC_HandleTypeDef *hrtc) {
 }
 
 STATIC void PYB_RTC_MspInit_Kick(RTC_HandleTypeDef *hrtc, bool rtc_use_lse, bool rtc_use_byp) {
-    /* To change the source clock of the RTC feature (LSE, LSI), You have to:
+    /* To change the source clock of the RTC feature (LSE, LSI, HSE), You have to:
        - Enable the power clock using __PWR_CLK_ENABLE()
        - Enable write access using HAL_PWR_EnableBkUpAccess() function before to
          configure the RTC clock source (to be done once after reset).
@@ -377,26 +403,34 @@ STATIC void PYB_RTC_MspInit_Kick(RTC_HandleTypeDef *hrtc, bool rtc_use_lse, bool
          __HAL_RCC_BACKUPRESET_RELEASE().
        - Configure the needed RTc clock source */
 
-    // RTC clock source uses LSE (external crystal) only if relevant
-    // configuration variable is set.  Otherwise it uses LSI (internal osc).
-
-    RCC_OscInitTypeDef RCC_OscInitStruct;
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI | RCC_OSCILLATORTYPE_LSE;
-    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
-    #if MICROPY_HW_RTC_USE_BYPASS
-    if (rtc_use_byp) {
-        RCC_OscInitStruct.LSEState = RCC_LSE_BYPASS;
-        RCC_OscInitStruct.LSIState = RCC_LSI_OFF;
-    } else
-    #endif
-    if (rtc_use_lse) {
-        RCC_OscInitStruct.LSEState = RCC_LSE_ON;
-        RCC_OscInitStruct.LSIState = RCC_LSI_OFF;
+    if (rtc_use_hse) {
+        // HSE is already started by SystemClock_Config; just open the backup domain.
+        #if !defined(STM32H7) && !defined(STM32WB)
+        __HAL_RCC_PWR_CLK_ENABLE();
+        #endif
+        HAL_PWR_EnableBkUpAccess();
     } else {
-        RCC_OscInitStruct.LSEState = RCC_LSE_OFF;
-        RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+        // RTC clock source uses LSE (external crystal) only if relevant
+        // configuration variable is set.  Otherwise it uses LSI (internal osc).
+
+        RCC_OscInitTypeDef RCC_OscInitStruct;
+        RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI | RCC_OSCILLATORTYPE_LSE;
+        RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+        #if MICROPY_HW_RTC_USE_BYPASS
+        if (rtc_use_byp) {
+            RCC_OscInitStruct.LSEState = RCC_LSE_BYPASS;
+            RCC_OscInitStruct.LSIState = RCC_LSI_OFF;
+        } else
+        #endif
+        if (rtc_use_lse) {
+            RCC_OscInitStruct.LSEState = RCC_LSE_ON;
+            RCC_OscInitStruct.LSIState = RCC_LSI_OFF;
+        } else {
+            RCC_OscInitStruct.LSEState = RCC_LSE_OFF;
+            RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+        }
+        PYB_RCC_OscConfig(&RCC_OscInitStruct);
     }
-    PYB_RCC_OscConfig(&RCC_OscInitStruct);
 
     // now ramp up osc. in background and flag calendear init needed
     rtc_need_init_finalise = true;
@@ -411,10 +445,21 @@ STATIC void PYB_RTC_MspInit_Kick(RTC_HandleTypeDef *hrtc, bool rtc_use_lse, bool
 #ifndef MICROPY_HW_RTC_BYP_TIMEOUT_MS
 #define MICROPY_HW_RTC_BYP_TIMEOUT_MS 150
 #endif
+#ifndef MICROPY_HW_RTC_HSE_TIMEOUT_MS
+#define MICROPY_HW_RTC_HSE_TIMEOUT_MS 100
+#endif
 
 STATIC HAL_StatusTypeDef PYB_RTC_MspInit_Finalise(RTC_HandleTypeDef *hrtc) {
     // we already had a kick so now wait for the corresponding ready state...
-    if (rtc_use_lse) {
+    if (rtc_use_hse) {
+        // HSE should already be running from SystemClock_Config
+        uint32_t tickstart = rtc_startup_tick;
+        while (__HAL_RCC_GET_FLAG(RCC_FLAG_HSERDY) == RESET) {
+            if ((HAL_GetTick() - tickstart) > MICROPY_HW_RTC_HSE_TIMEOUT_MS) {
+                return HAL_TIMEOUT;
+            }
+        }
+    } else if (rtc_use_lse) {
         // we now have to wait for LSE ready or timeout
         uint32_t timeout = MICROPY_HW_RTC_LSE_TIMEOUT_MS;
         #if MICROPY_HW_RTC_USE_BYPASS
@@ -440,7 +485,14 @@ STATIC HAL_StatusTypeDef PYB_RTC_MspInit_Finalise(RTC_HandleTypeDef *hrtc) {
 
     RCC_PeriphCLKInitTypeDef PeriphClkInitStruct;
     PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_RTC;
-    if (rtc_use_lse) {
+    if (rtc_use_hse) {
+        #if MICROPY_HW_RTC_USE_HSE
+        #ifndef MICROPY_HW_RTC_HSE_RTCCLKSOURCE
+        #error "MICROPY_HW_RTC_USE_HSE requires MICROPY_HW_RTC_HSE_RTCCLKSOURCE (e.g. RCC_RTCCLKSOURCE_HSE_DIV25)"
+        #endif
+        PeriphClkInitStruct.RTCClockSelection = MICROPY_HW_RTC_HSE_RTCCLKSOURCE;
+        #endif
+    } else if (rtc_use_lse) {
         PeriphClkInitStruct.RTCClockSelection = RCC_RTCCLKSOURCE_LSE;
     } else {
         PeriphClkInitStruct.RTCClockSelection = RCC_RTCCLKSOURCE_LSI;
